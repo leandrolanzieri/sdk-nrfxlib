@@ -14,6 +14,46 @@
 #include "nrf_cc3xx_platform_defines.h"
 #include "nrf_cc3xx_platform_mutex.h"
 
+#define CONFIG_NRFXLIB_MUTEX_NUMOF  64
+
+typedef struct {
+    bool used;
+    mutex_t mutex;
+} mutex_pool_item_t;
+
+static mutex_pool_item_t _mutex_pool[CONFIG_NRFXLIB_MUTEX_NUMOF] = {
+        {
+            .used = false,
+            .mutex = MUTEX_INIT
+        }
+    };
+static mutex_t _allocation_mutex = MUTEX_INIT;
+
+static mutex_t *_alloc_mutex(void) {
+    mutex_lock(&_allocation_mutex);
+    mutex_t *ret = NULL;
+
+    for (unsigned i = 0; i < CONFIG_NRFXLIB_MUTEX_NUMOF; i++) {
+        if (!_mutex_pool[i].used) {
+            ret = &_mutex_pool[i].mutex;
+            _mutex_pool[i].used = true;
+            mutex_init(ret);
+            break;
+        }
+    }
+
+    mutex_unlock(&_allocation_mutex);
+    return ret;
+}
+
+static void _dealloc_mutex(mutex_t *mutex) {
+    mutex_lock(&_allocation_mutex);
+
+    mutex_pool_item_t *item = container_of(mutex, mutex_pool_item_t, mutex);
+    item->used = false;
+
+    mutex_unlock(&_allocation_mutex);
+}
 
 /** @brief external reference to the cc3xx platform mutex APIs*/
 extern nrf_cc3xx_platform_mutex_apis_t  platform_mutex_apis;
@@ -100,20 +140,37 @@ nrf_cc3xx_platform_mutex_t heap_mutex =
  */
 static void mutex_init_platform(nrf_cc3xx_platform_mutex_t *mutex)
 {
-    (void) mutex;
-    // DEBUG("mutex_init_platform\n");
-    // /* Ensure that the mutex is valid (not NULL) */
-    // if (mutex == NULL) {
-    //     platform_abort_apis.abort_fn("mutex_init called with NULL parameter");
-    // }
+    mutex_t *riot_mutex;
+    DEBUG("mutex_init_platform\n");
+    /* Ensure that the mutex is valid (not NULL) */
+    if (mutex == NULL) {
+        platform_abort_apis.abort_fn("mutex_init called with NULL parameter");
+    }
 
-    // if (mutex->flags == NRF_CC3XX_PLATFORM_MUTEX_MASK_INVALID) {
-    //     mutex_init(mutex->mutex);
-    //     /* Set the mask to indicate that the mutex is valid */
-    //     mutex->flags |= NRF_CC3XX_PLATFORM_MUTEX_MASK_IS_VALID;
-    // }
+    /* Allocate if this has not been initialized statically */
+    if (mutex->flags == NRF_CC3XX_PLATFORM_MUTEX_MASK_INVALID &&
+        mutex->mutex == NULL) {
+        /* Use mutex from the pool */
+        riot_mutex = _alloc_mutex();
+        if (!riot_mutex) {
+            DEBUG("mutex_init_platform: could not allocate mutex\n");
+            platform_abort_apis.abort_fn("could not allocate mutex\n");
+            return;
+        }
+
+        mutex_init(riot_mutex);
+        mutex->mutex = riot_mutex;
+
+        /* Set a flag to ensure that mutex is deallocated by the freeing operation */
+        mutex->flags |= NRF_CC3XX_PLATFORM_MUTEX_MASK_IS_ALLOCATED;
+    }
+
+    riot_mutex = mutex->mutex;
+    mutex_init(riot_mutex);
+
+    /* Set the mask to indicates that the mutex is valid */
+    mutex->flags |= NRF_CC3XX_PLATFORM_MUTEX_MASK_IS_VALID;
 }
-
 
 /** @brief Static function to free a mutex
  */
@@ -130,8 +187,15 @@ static void mutex_free_platform(nrf_cc3xx_platform_mutex_t *mutex)
         return;
     }
 
+    /* Check if the mutex was allocated or being statically defined */
+    if ((mutex->flags & NRF_CC3XX_PLATFORM_MUTEX_MASK_IS_ALLOCATED) != 0) {
+        _dealloc_mutex(mutex->mutex);
+        mutex->mutex = NULL;
+    }
+    else {
+        mutex_init(mutex->mutex);
+    }
     // mutex_unlock(mutex->mutex);
-    mutex_init(mutex->mutex);
 
     /* Reset the mutex to invalid state */
     mutex->flags = NRF_CC3XX_PLATFORM_MUTEX_MASK_INVALID;
